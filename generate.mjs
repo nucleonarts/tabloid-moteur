@@ -41,8 +41,38 @@ Règles :
 - "summary" : UNE seule phrase de 25 mots maximum, factuelle, sans jugement ni sensationnalisme.
 - "category" : une valeur parmi ${CATEGORIES.map((c) => `"${c}"`).join(", ")}.
 - N'invente rien : appuie-toi uniquement sur les titres et extraits fournis.
-- Réponds UNIQUEMENT avec un tableau JSON, sans texte autour ni balises de code, au format :
-[{"headline":"...","summary":"...","category":"...","articleIds":[0,3]}]`;
+- Transmets le flash en appelant l'outil publier_flash.`;
+
+// Claude doit répondre en appelant cet « outil » : sa réponse arrive alors en JSON
+// déjà structuré, sans texte autour, et sans phase de réflexion préalable.
+const FLASH_TOOL = {
+  name: "publier_flash",
+  description: "Publie le flash d'information du jour, du plus important au moins important.",
+  input_schema: {
+    type: "object",
+    properties: {
+      stories: {
+        type: "array",
+        description: `Au maximum ${MAX_STORIES} informations.`,
+        items: {
+          type: "object",
+          properties: {
+            headline: { type: "string", description: "Titre de 12 mots maximum, en français." },
+            summary: { type: "string", description: "Une seule phrase de 25 mots maximum, en français." },
+            category: { type: "string", enum: CATEGORIES },
+            articleIds: {
+              type: "array",
+              items: { type: "integer" },
+              description: "Numéros des articles qui traitent de cet événement, l'article de référence en premier.",
+            },
+          },
+          required: ["headline", "summary", "category", "articleIds"],
+        },
+      },
+    },
+    required: ["stories"],
+  },
+};
 
 // ---- Lecture des flux RSS / Atom ---------------------------------------------
 const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", rsquo: "’", lsquo: "‘", rdquo: "”", ldquo: "“", hellip: "…", mdash: "—", ndash: "–", eacute: "é", egrave: "è", agrave: "à", ccedil: "ç" };
@@ -143,16 +173,18 @@ async function callClaude(userText) {
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 4000,
+        // Large marge : sur Haiku 5.5, une éventuelle réflexion compte dans cette limite
+        max_tokens: 16000,
         system: SYSTEM_PROMPT,
+        tools: [FLASH_TOOL],
+        tool_choice: { type: "tool", name: FLASH_TOOL.name },
         messages: [{ role: "user", content: userText }],
       }),
-      signal: AbortSignal.timeout(120000),
+      signal: AbortSignal.timeout(180000),
     });
     const body = await response.json().catch(() => ({}));
-    if (response.ok) {
-      return (body.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-    }
+    if (response.ok) return body;
+
     const detail = body?.error?.message || response.statusText;
     const retryable = response.status === 429 || response.status >= 500;
     if (retryable && attempt < 3) {
@@ -164,20 +196,51 @@ async function callClaude(userText) {
   }
 }
 
-export function buildStories(rawText, articles, dayStamp) {
-  const text = rawText.replace(/```(?:json)?/g, "");
-  const start = text.indexOf("[");
-  const end = text.lastIndexOf("]");
-  if (start === -1 || end <= start) throw new Error("Réponse de Claude illisible (pas de tableau JSON).");
-  const parsed = JSON.parse(text.slice(start, end + 1));
-  if (!Array.isArray(parsed)) throw new Error("Réponse de Claude illisible (pas un tableau).");
+/** Décrit une réponse de Claude en une ligne, pour comprendre un échec dans les journaux GitHub. */
+function describeResponse(body) {
+  const blocks = (body.content || []).map((b) => b.type).join(", ") || "aucun";
+  const usage = body.usage ? `, ${body.usage.output_tokens} jetons produits` : "";
+  return `stop_reason=${body.stop_reason ?? "?"}, blocs=[${blocks}]${usage}`;
+}
 
-  return parsed
+/** Extrait la liste des infos de la réponse de Claude (appel d'outil, ou texte JSON en secours). */
+export function extractEntries(body) {
+  const content = Array.isArray(body?.content) ? body.content : [];
+
+  const toolCall = content.find((b) => b.type === "tool_use" && b.name === FLASH_TOOL.name);
+  if (toolCall && Array.isArray(toolCall.input?.stories)) return toolCall.input.stories;
+
+  // Secours : JSON écrit en texte
+  const text = content.filter((b) => b.type === "text").map((b) => b.text).join("").replace(/```(?:json)?/g, "");
+  const start = text.search(/[\[{]/);
+  if (start !== -1) {
+    try {
+      const parsed = JSON.parse(text.slice(start, Math.max(text.lastIndexOf("]"), text.lastIndexOf("}")) + 1));
+      if (Array.isArray(parsed)) return parsed;
+      if (Array.isArray(parsed?.stories)) return parsed.stories;
+    } catch {
+      // on tombe sur l'erreur détaillée ci-dessous
+    }
+  }
+
+  const info = describeResponse(body);
+  if (body?.stop_reason === "refusal") {
+    throw new Error(`Claude a décliné la demande (filtre de sécurité). Le prochain lancement réessaiera. [${info}]`);
+  }
+  if (body?.stop_reason === "max_tokens") {
+    throw new Error(`Claude a été coupé avant de finir sa réponse (limite de longueur atteinte). [${info}]`);
+  }
+  const preview = text.trim().slice(0, 300);
+  throw new Error(`Réponse de Claude illisible. [${info}]${preview ? ` Début du texte : « ${preview} »` : ""}`);
+}
+
+export function buildStories(entries, articles, dayStamp) {
+  return entries
     .map((entry) => {
-      const ids = [...new Set((Array.isArray(entry.articleIds) ? entry.articleIds : []).map(Number))]
+      const ids = [...new Set((Array.isArray(entry?.articleIds) ? entry.articleIds : []).map(Number))]
         .filter((i) => Number.isInteger(i) && articles[i]);
-      const headline = String(entry.headline ?? "").trim();
-      const summary = String(entry.summary ?? "").trim();
+      const headline = String(entry?.headline ?? "").trim();
+      const summary = String(entry?.summary ?? "").trim();
       if (ids.length === 0 || !headline || !summary) return null;
       return {
         headline,
@@ -189,6 +252,24 @@ export function buildStories(rawText, articles, dayStamp) {
     .filter(Boolean)
     .slice(0, MAX_STORIES)
     .map((story, index) => ({ id: `${dayStamp}-${index}`, ...story }));
+}
+
+/** Demande le flash à Claude ; un second essai si la réponse est inutilisable. */
+async function summarize(articles, dayStamp) {
+  const list = articles.map((a, i) => `[${i}] (${a.source}) ${a.title}\n${a.snippet}`).join("\n\n");
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const body = await callClaude(list);
+      const stories = buildStories(extractEntries(body), articles, dayStamp);
+      if (stories.length === 0) throw new Error(`Claude n'a renvoyé aucune info exploitable. [${describeResponse(body)}]`);
+      return stories;
+    } catch (error) {
+      const apiError = /^(Clé API|Crédit|Modèle|Erreur de l'API)/.test(error.message);
+      if (apiError || attempt >= 2) throw error;
+      console.warn(`⚠︎ ${error.message}`);
+      console.warn("Nouvel essai…");
+    }
+  }
 }
 
 // ---- Page de contrôle ---------------------------------------------------------
@@ -219,10 +300,8 @@ async function main() {
   if (articles.length === 0) throw new Error("Aucun article récupéré : tous les flux ont échoué.");
   console.log(`${articles.length} articles envoyés à Claude (${MODEL})…`);
 
-  const list = articles.map((a, i) => `[${i}] (${a.source}) ${a.title}\n${a.snippet}`).join("\n\n");
   const now = new Date();
-  const stories = buildStories(await callClaude(list), articles, now.toISOString().slice(0, 10));
-  if (stories.length === 0) throw new Error("Claude n'a renvoyé aucune info exploitable.");
+  const stories = await summarize(articles, now.toISOString().slice(0, 10));
 
   const digest = { generatedAt: now.toISOString(), stories };
   await mkdir(OUT_DIR, { recursive: true });
