@@ -1,0 +1,51 @@
+name: Tabloïd - préparer le flash
+
+on:
+  schedule:
+    # Toutes les heures à la minute 17, de 4 h à 21 h UTC
+    # (5 h à 22 h à Paris en hiver, 6 h à 23 h en été)
+    - cron: "17 4-21 * * *"
+  # Permet aussi de le lancer à la main (onglet Actions > Run workflow)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: tabloid
+  cancel-in-progress: false
+
+jobs:
+  flash:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v7
+
+      - name: Installer Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Lire les journaux et résumer avec Claude
+        run: node generate.mjs
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Préparer la publication
+        uses: actions/configure-pages@v6
+
+      - name: Envoyer le flash
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+      - name: Publier
+        id: deployment
+        uses: actions/deploy-pages@v5
